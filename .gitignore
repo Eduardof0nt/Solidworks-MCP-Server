@@ -1,0 +1,68 @@
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ─── Virtual environments ───
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ─── pytest / coverage ───
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ─── Editors / IDE ───
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ─── SolidWorks temporary / backup files ───
+*.bak
+*.SLDPRT.bak
+*.SLDASM.bak
+*.SLDDRW.bak
+~$*
+*.swap.SLDPRT
+*.swap.SLDASM
+*.swap.SLDDRW
+
+# ─── MCP server runtime artifacts ───
+sw_mcp_temp_macro.swb
+sw_screenshot.bmp
+sw_screenshot.png
+*.log
+
+# ─── Project-local Claude session data (do not commit user state) ───
+.claude/
