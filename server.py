@@ -16,9 +16,56 @@ Requirements:
 import asyncio
 import functools
 import json
+import os
 import sys
 import concurrent.futures
 from typing import Any, Dict, List, Optional, Tuple
+
+# ─── Single-Instance Lock ────────────────────────────────────────────────────
+# Multiple Python MCP server processes would each try to grab SolidWorks via
+# GetActiveObject("SldWorks.Application"), causing COM contention and tool
+# call timeouts. We use a Windows named mutex (auto-released on process exit,
+# no stale lock files) to ensure exactly one instance is ever alive.
+#
+# Set environment variable SW_MCP_ALLOW_MULTIPLE=1 to disable this check
+# (useful for debugging / dev — not recommended in production).
+
+def _acquire_single_instance_lock():
+    """Acquire a Windows named mutex. Exit if another instance holds it."""
+    if os.environ.get("SW_MCP_ALLOW_MULTIPLE") == "1":
+        return None
+    if sys.platform != "win32":
+        return None  # only enforce on Windows (where SolidWorks runs)
+    try:
+        import win32event
+        import win32api
+        import winerror
+    except ImportError:
+        # pywin32 missing — silently skip lock (will fail later anyway when
+        # the COM imports try to load)
+        return None
+
+    # Use "Local\" prefix (not "Global\") so the lock is per-user-session;
+    # this avoids issues with multi-user / RDP scenarios.
+    mutex_name = "Local\\SolidWorksMCPServer_SingleInstance_v1"
+    mutex = win32event.CreateMutex(None, False, mutex_name)
+    last_err = win32api.GetLastError()
+    if last_err == winerror.ERROR_ALREADY_EXISTS:
+        sys.stderr.write(
+            "ERROR: another SolidWorks MCP server instance is already running.\n"
+            "  Only one server can run at a time (SolidWorks COM is single-instance).\n"
+            "  If you are sure no other instance is alive, restart the host (Claude\n"
+            "  Desktop / Claude Code) to clear orphaned subprocesses, or set the\n"
+            "  environment variable SW_MCP_ALLOW_MULTIPLE=1 to bypass this check.\n"
+        )
+        sys.stderr.flush()
+        sys.exit(1)
+    # Keep handle alive for the lifetime of the process; mutex is auto-released
+    # by the kernel when the process exits (clean or crash).
+    return mutex
+
+
+_single_instance_mutex = _acquire_single_instance_lock()
 
 import pythoncom
 from pydantic import BaseModel, Field, field_validator, ConfigDict
@@ -2184,14 +2231,14 @@ class CombineBodiesInput(BaseModel):
 
 
 class MoveBodyInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
+    model_config = ConfigDict(str_strip_whitespace=True, protected_namespaces=())
     dx: float = Field(default=0.0, description="X translation in mm")
     dy: float = Field(default=0.0, description="Y translation in mm")
     dz: float = Field(default=0.0, description="Z translation in mm")
     rx: float = Field(default=0.0, description="X rotation in degrees")
     ry: float = Field(default=0.0, description="Y rotation in degrees")
     rz: float = Field(default=0.0, description="Z rotation in degrees")
-    copy: bool = Field(default=False, description="Copy instead of move")
+    make_copy: bool = Field(default=False, alias="copy", description="Copy instead of move")
 
 
 class ScaleBodyInput(BaseModel):
@@ -2234,7 +2281,7 @@ async def sw_split_body() -> str:
 async def sw_move_body(params: MoveBodyInput) -> str:
     """Move or copy the selected body by translation (mm) and rotation (deg)."""
     try:
-        result = await _run(_sw.move_body, params.dx, params.dy, params.dz, params.rx, params.ry, params.rz, params.copy)
+        result = await _run(_sw.move_body, params.dx, params.dy, params.dz, params.rx, params.ry, params.rz, params.make_copy)
         return _ok(result)
     except Exception as e:
         return _err(e)

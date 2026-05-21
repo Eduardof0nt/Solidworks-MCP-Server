@@ -595,6 +595,16 @@ Claude should call `sw_connect` and `sw_get_status`, returning the SolidWorks ve
 - The first call after launch can be slow (SolidWorks initializing). Retry after a few seconds.
 - If persistent, restart SolidWorks and your MCP client.
 
+### `ERROR: another SolidWorks MCP server instance is already running`
+The server enforces a **single-instance lock** (Windows named mutex `Local\SolidWorksMCPServer_SingleInstance_v1`) because multiple processes fighting over the same SolidWorks COM connection causes every tool call to hang.
+- If both Claude Desktop and Claude Code try to launch the server, only the first succeeds — the second client will see no `solidworks` tools.
+- To fix: fully close whichever client you don't need (system tray → Quit for Claude Desktop, or close all CLI sessions). The mutex auto-releases when the holding process exits.
+- To bypass for debugging only, set `SW_MCP_ALLOW_MULTIPLE=1` in the spawning environment.
+
+### SolidWorks GUI never appears (processes alive but no window)
+If `Get-Process SLDWORKS` shows running processes with `MainWindowHandle: 0`, those are zombies from an interrupted launch — typically after a force-kill (`Stop-Process -Force`) during startup. They will never finish initializing and are not registered in the COM Running Object Table.
+- Fix: `Get-Process SLDWORKS,sldworks_fs | Stop-Process -Force` to kill them, then launch SolidWorks fresh from the Start menu and **wait for the main window** before calling any `sw_*` tool.
+
 ### `pip install` permission denied
 - Use `pip install --user -r requirements.txt` or create a virtualenv.
 
