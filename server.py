@@ -85,6 +85,35 @@ _executor = concurrent.futures.ThreadPoolExecutor(
 _sw = SolidWorksClient()
 
 
+def _startup_connect() -> None:
+    """Run on the COM executor thread at server startup.
+
+    Tries to attach to (or launch) SolidWorks and ensures at least one document
+    is open so that the COM Running Object Table entry is active and all tools
+    work on the very first call without a manual sw_connect step.
+    Non-fatal: if SolidWorks isn't installed / can't start, the server keeps
+    running and will retry when the first tool is called.
+    """
+    try:
+        result = _sw.connect(launch_if_not_running=True, ensure_document=True)
+        sys.stderr.write(
+            f"[SW-MCP] Startup connect OK — status={result.get('status')} "
+            f"version={result.get('version')} "
+            f"doc={result.get('auto_opened_document', 'pre-existing')}\n"
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[SW-MCP] Startup connect failed (SolidWorks not available yet): {exc}\n"
+            "  SolidWorks will be connected automatically on the first tool call.\n"
+        )
+    sys.stderr.flush()
+
+
+# Submit the startup task to the COM STA executor immediately.
+# Using submit() (not run_until_complete) keeps server startup non-blocking.
+_executor.submit(_startup_connect)
+
+
 async def _run(fn, *args, **kwargs):
     """Execute fn(*args, **kwargs) on the dedicated SolidWorks COM thread."""
     loop = asyncio.get_event_loop()

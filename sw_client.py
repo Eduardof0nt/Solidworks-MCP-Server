@@ -211,26 +211,92 @@ class SolidWorksClient:
 
     # ─── Connection ──────────────────────────────────────────────────────────
 
-    def connect(self, launch_if_not_running: bool = True) -> Dict:
-        """Connect to a running SolidWorks instance, optionally launching it."""
+    def connect(self, launch_if_not_running: bool = True, ensure_document: bool = True) -> Dict:
+        """Connect to a running SolidWorks instance, optionally launching it.
+
+        Args:
+            launch_if_not_running: Launch SolidWorks if not already running.
+            ensure_document: If True (default) and no document is open after
+                connecting/launching, automatically create a new blank Part so
+                that the COM Running Object Table registration is active and
+                document-level tools work immediately.
+        """
+        import time
+
+        # ── 1. Re-use an existing live reference ──────────────────────────────
         if self._app is not None:
             try:
                 rev = self._app.RevisionNumber
-                return {"status": "already_connected", "version": rev}
+                result = {"status": "already_connected", "version": rev}
+                if ensure_document:
+                    self._open_default_doc_if_needed(result)
+                return result
             except Exception:
                 self._app = None
 
+        # ── 2. Attach to a running SolidWorks via COM ROT ─────────────────────
         try:
             self._app = win32com.client.GetActiveObject("SldWorks.Application")
-            return {"status": "connected", "version": self._app.RevisionNumber}
+            result = {"status": "connected", "version": self._app.RevisionNumber}
+            if ensure_document:
+                self._open_default_doc_if_needed(result)
+            return result
         except Exception:
-            if not launch_if_not_running:
-                raise RuntimeError(
-                    "SolidWorks is not running. Set launch_if_not_running=True or start SolidWorks manually."
-                )
-            self._app = win32com.client.Dispatch("SldWorks.Application")
-            self._app.Visible = True
-            return {"status": "launched", "version": self._app.RevisionNumber}
+            pass
+
+        if not launch_if_not_running:
+            raise RuntimeError(
+                "SolidWorks is not running. Set launch_if_not_running=True or start SolidWorks manually."
+            )
+
+        # ── 3. Launch SolidWorks via CoCreateInstance (Dispatch) ──────────────
+        self._app = win32com.client.Dispatch("SldWorks.Application")
+        self._app.Visible = True
+
+        # Wait up to 30 s for SolidWorks to finish initialising
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                rev = self._app.RevisionNumber
+                if rev:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("SolidWorks launched but did not become ready within 30 seconds.")
+
+        result = {"status": "launched", "version": self._app.RevisionNumber}
+        if ensure_document:
+            self._open_default_doc_if_needed(result)
+        return result
+
+    def _open_default_doc_if_needed(self, status_dict: Dict) -> None:
+        """If SolidWorks has no open document, create a new blank Part.
+
+        SolidWorks only registers itself in the Windows COM Running Object Table
+        (ROT) once a document is open.  Calling this after every connect() ensures
+        the server is immediately usable without a separate manual step.
+        """
+        import time
+        try:
+            doc = self._app.ActiveDoc
+            if doc is None:
+                # Give SW a moment to finish loading (e.g. after a fresh launch)
+                time.sleep(1.0)
+                doc = self._app.ActiveDoc
+            if doc is None:
+                tmpl = self._find_template("part")
+                new_doc = _invoke(self._app, _DISPID_NEW_DOCUMENT, tmpl, 0, 0.0, 0.0)
+                if new_doc is not None:
+                    title = _get(new_doc, 'GetTitle') or "Part1"
+                    status_dict["auto_opened_document"] = title
+                    status_dict["note"] = (
+                        "No document was open; created a new blank Part automatically. "
+                        "Use sw_open_document or sw_create_part to work with a specific file."
+                    )
+        except Exception:
+            pass  # Non-fatal – tools will surface the "no active document" error if needed
 
     def get_status(self) -> Dict:
         """Get connection status and active document info."""
