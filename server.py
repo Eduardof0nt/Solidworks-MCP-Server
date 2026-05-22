@@ -31,37 +31,41 @@ from typing import Any, Dict, List, Optional, Tuple
 # (useful for debugging / dev — not recommended in production).
 
 def _acquire_single_instance_lock():
-    """Acquire a Windows named mutex. Exit if another instance holds it."""
-    if os.environ.get("SW_MCP_ALLOW_MULTIPLE") == "1":
-        return None
+    """Try to acquire a Windows named mutex for soft single-instance detection.
+
+    Running two server instances simultaneously is *safe* — they both attach to
+    the same SolidWorks process via COM and SolidWorks serialises concurrent
+    calls through its STA message queue.  The old hard exit() was blocking
+    Claude Desktop's chat server from coexisting with a Cowork-session server.
+
+    Now we only log a warning and continue; the environment variable
+    SW_MCP_SINGLE=1 restores the old hard-exit behaviour for CI / testing.
+    """
     if sys.platform != "win32":
-        return None  # only enforce on Windows (where SolidWorks runs)
+        return None
     try:
         import win32event
         import win32api
         import winerror
     except ImportError:
-        # pywin32 missing — silently skip lock (will fail later anyway when
-        # the COM imports try to load)
         return None
 
-    # Use "Local\" prefix (not "Global\") so the lock is per-user-session;
-    # this avoids issues with multi-user / RDP scenarios.
     mutex_name = "Local\\SolidWorksMCPServer_SingleInstance_v1"
     mutex = win32event.CreateMutex(None, False, mutex_name)
     last_err = win32api.GetLastError()
     if last_err == winerror.ERROR_ALREADY_EXISTS:
+        if os.environ.get("SW_MCP_SINGLE") == "1":
+            sys.stderr.write(
+                "ERROR: SW_MCP_SINGLE=1 is set and another instance is already running. Exiting.\n"
+            )
+            sys.stderr.flush()
+            sys.exit(1)
         sys.stderr.write(
-            "ERROR: another SolidWorks MCP server instance is already running.\n"
-            "  Only one server can run at a time (SolidWorks COM is single-instance).\n"
-            "  If you are sure no other instance is alive, restart the host (Claude\n"
-            "  Desktop / Claude Code) to clear orphaned subprocesses, or set the\n"
-            "  environment variable SW_MCP_ALLOW_MULTIPLE=1 to bypass this check.\n"
+            "[SW-MCP] Warning: another server instance is already running. "
+            "Both will share the same SolidWorks session — this is normally fine.\n"
+            "  Set SW_MCP_SINGLE=1 to enforce a hard single-instance limit.\n"
         )
         sys.stderr.flush()
-        sys.exit(1)
-    # Keep handle alive for the lifetime of the process; mutex is auto-released
-    # by the kernel when the process exits (clean or crash).
     return mutex
 
 
