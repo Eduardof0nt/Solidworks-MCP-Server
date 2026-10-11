@@ -120,11 +120,37 @@ def _startup_connect() -> None:
 _executor.submit(_startup_connect)
 
 
+def _in_command(fn, *args, **kwargs):
+    """Run fn with ISldWorks.CommandInProgress set, always resetting it afterwards.
+
+    API help: CommandInProgress tells SOLIDWORKS an out-of-process application is making a
+    sequence of API calls, so it reduces its UI updates meanwhile. Without it, SW 2026 SP4
+    intermittently crashed in its idle-time UI update (OnIdle -> conditionalBlockCmd /
+    uoSelRefGeom_c::getRefGeom access violation) while a sketch was being edited via the API.
+    """
+    app = _sw._app
+    flagged = False
+    if app is not None:
+        try:
+            app.CommandInProgress = True
+            flagged = True
+        except Exception:
+            pass  # stale connection; fn will reconnect or report the error
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        if flagged:
+            try:
+                app.CommandInProgress = False
+            except Exception:
+                pass
+
+
 async def _run(fn, *args, **kwargs):
     """Execute fn(*args, **kwargs) on the dedicated SolidWorks COM thread."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
-        _executor, functools.partial(fn, *args, **kwargs)
+        _executor, functools.partial(_in_command, fn, *args, **kwargs)
     )
 
 

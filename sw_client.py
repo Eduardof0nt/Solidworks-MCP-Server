@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pythoncom
 import win32com.client
+import win32com.client.dynamic
 
 # ─── DISPID Constants (SolidWorks 2024 / ISldWorks) ──────────────────────────
 # win32com late-binding hits PROPERTYGET for some methods in SW 2024.
@@ -45,6 +46,20 @@ def _resolve_dispid(obj, method_name: str) -> Optional[int]:
         return None
 
 
+def _late_bound(obj_or_progid):
+    """Return a late-bound (dynamic) SldWorks dispatch.
+
+    This module passes VARIANT byref out-params (OpenDoc6, SaveAs, ActivateDoc3, ...), which only
+    work with late binding. If a makepy cache for the SldWorks type library exists (e.g. created
+    by another pywin32 script via gencache.EnsureModule), win32com.client.GetActiveObject/Dispatch
+    return early-bound wrappers instead, and those calls fail with "int() argument must be ...
+    not 'VARIANT'". Wrapping the raw IDispatch keeps behaviour independent of that cache.
+    """
+    if isinstance(obj_or_progid, str):
+        return win32com.client.dynamic.Dispatch(obj_or_progid)
+    return win32com.client.dynamic.Dispatch(getattr(obj_or_progid, "_oleobj_", obj_or_progid))
+
+
 def _get(obj, name: str):
     """
     Access a COM attribute that SolidWorks 2024 exposes as a dual property/method.
@@ -53,6 +68,10 @@ def _get(obj, name: str):
     """
     val = getattr(obj, name, None)
     if isinstance(val, (str, int, float, bool, bytes, type(None))):
+        return val
+    if hasattr(val, "_oleobj_"):
+        # A COM object *is* the member's value (late-bound property-get already invoked it).
+        # Calling it would invoke its default member and return a different object.
         return val
     if callable(val):
         try:
@@ -236,7 +255,7 @@ class SolidWorksClient:
 
         # ── 2. Attach to a running SolidWorks via COM ROT ─────────────────────
         try:
-            self._app = win32com.client.GetActiveObject("SldWorks.Application")
+            self._app = _late_bound(win32com.client.GetActiveObject("SldWorks.Application"))
             result = {"status": "connected", "version": _get(self._app, 'RevisionNumber')}
             if ensure_document:
                 self._open_default_doc_if_needed(result)
@@ -251,7 +270,7 @@ class SolidWorksClient:
             )
 
         # ── 3. Launch SolidWorks via CoCreateInstance (Dispatch) ──────────────
-        self._app = win32com.client.Dispatch("SldWorks.Application")
+        self._app = _late_bound("SldWorks.Application")
         self._app.Visible = True
 
         # Wait up to 30 s for SolidWorks to finish initialising
@@ -304,7 +323,7 @@ class SolidWorksClient:
         if self._app is None:
             # Try auto-connect silently
             try:
-                self._app = win32com.client.GetActiveObject("SldWorks.Application")
+                self._app = _late_bound(win32com.client.GetActiveObject("SldWorks.Application"))
             except Exception:
                 return {"connected": False, "active_document": None}
         try:
@@ -968,10 +987,24 @@ class SolidWorksClient:
 
     def insert_component(self, file_path: str, x: float = 0.0, y: float = 0.0, z: float = 0.0, fixed: bool = False) -> Dict:
         doc = self._active_doc()
-        comp = doc.AddComponent5(file_path, 0, "", fixed, _m(x), _m(y), _m(z))
+        if _get(doc, 'GetType') != SW_DOC_ASSEMBLY:
+            raise RuntimeError("Active document is not an assembly.")
+        app = self._ensure_app()
+        # AddComponent5 requires the file to be loaded in memory (API help remarks).
+        if app.GetOpenDocumentByName(file_path) is None:
+            asm_title = _get(doc, 'GetTitle')
+            self.open_document(file_path, read_only=False)
+            errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            app.ActivateDoc3(asm_title, False, 1, errors)  # 1 = swDontRebuildActiveDoc
+        # AddComponent5(CompName, ConfigOption, NewConfigName, UseConfigForPartReferences,
+        #               ExistingConfigName, X, Y, Z) — X/Y/Z are approximate (bounding-box relative).
+        comp = doc.AddComponent5(file_path, 0, "", False, "", _m(x), _m(y), _m(z))
         if comp is None:
             raise RuntimeError(f"Failed to insert component '{file_path}'. Ensure the file exists and the active document is an assembly.")
-        return {"component": comp.Name2, "fixed": fixed}
+        name = _get(comp, 'Name2')
+        if fixed:
+            self.fix_component(name, True)
+        return {"component": name, "fixed": fixed}
 
     def add_mate(self, mate_type: str, entity1: str, entity2: str,
                  distance_or_angle: Optional[float] = None, flip_mate: bool = False) -> Dict:
@@ -1009,30 +1042,52 @@ class SolidWorksClient:
 
     def fix_component(self, component_name: str, fix: bool = True) -> Dict:
         doc = self._active_doc()
-        doc.Extension.SelectByID2(component_name, "COMPONENT", 0, 0, 0, False, 0, win32com.client.VARIANT(pythoncom.VT_DISPATCH, None), 0)
+        if _get(doc, 'GetType') != SW_DOC_ASSEMBLY:
+            raise RuntimeError("Active document is not an assembly.")
+        comp = doc.GetComponentByName(component_name)
+        if comp is None:
+            raise RuntimeError(f"Component '{component_name}' not found (use the name shown by sw_get_assembly_tree, e.g. 'part-1').")
+        # IAssemblyDoc.FixComponent / UnfixComponent act on the selected component
+        # (EditMakeRigid/EditMakeFlexible do not exist in the API).
+        comp.Select4(False, win32com.client.VARIANT(pythoncom.VT_DISPATCH, None), False)
         if fix:
-            doc.EditMakeRigid()
+            doc.FixComponent()
         else:
-            doc.EditMakeFlexible()
-        return {"component": component_name, "fixed": fix}
+            doc.UnfixComponent()
+        doc.ClearSelection2(True)
+        return {"component": component_name, "fixed": bool(_get(comp, 'IsFixed'))}
 
     def check_interference(self, treat_sub_as_comp: bool = True) -> Dict:
         doc = self._active_doc()
         if _get(doc, 'GetType') != SW_DOC_ASSEMBLY:
             raise RuntimeError("Interference check requires an assembly document.")
-        # Use the interference detection object
-        interference = doc.InterferenceDetection
-        interference.UseTransform = True
+        # Opening the Interference Detection pane on an assembly with < 2 components crashes
+        # SW 2026 SP4 (uiInterferAsmDveDlg_c teardown), and there is nothing to check anyway.
+        if (doc.GetComponentCount(False) or 0) < 2:
+            return {"interference_count": 0, "interferences": [],
+                    "note": "Assembly has fewer than 2 components; nothing to check."}
+        # Documented sequence (API help "Run Interference Detection"): open the pane with
+        # ToolsCheckInterference, then use IAssemblyDoc.InterferenceDetectionManager.
+        doc.ToolsCheckInterference()
+        interference = doc.InterferenceDetectionManager  # object-valued property: plain attribute
         interference.TreatCoincidenceAsInterference = False
-        interference.IncludeSurfaceBodies = True
-        count = interference.GetCount()
-        interferences = []
-        for i in range(count):
-            interf = interference.Interference(i)
-            interferences.append({
-                "volume_mm3": interf.Volume / (MM ** 3) if interf.Volume else 0,
-            })
-        interference.Done()
+        interference.TreatSubAssembliesAsComponents = treat_sub_as_comp
+        try:
+            count = _get(interference, 'GetInterferenceCount') or 0
+            interferences = []
+            if count:
+                for interf in _get(interference, 'GetInterferences') or ():
+                    if not hasattr(interf, "_oleobj_"):
+                        interf = win32com.client.Dispatch(interf)
+                    volume = _get(interf, 'Volume')
+                    comps = interf.Components or ()
+                    interferences.append({
+                        "volume_mm3": volume / (MM ** 3) if volume else 0,
+                        "components": [_get(c if hasattr(c, "_oleobj_") else win32com.client.Dispatch(c), 'Name2')
+                                       for c in comps],
+                    })
+        finally:
+            interference.Done()
         return {"interference_count": count, "interferences": interferences}
 
     def explode_assembly(self) -> Dict:
@@ -1068,7 +1123,7 @@ class SolidWorksClient:
         doc = self._active_doc()
         note = doc.InsertNote(text)
         if note:
-            ann = note.GetAnnotation()
+            ann = _get(note, 'GetAnnotation')
             if ann:
                 ann.SetPosition2(_m(x), _m(y), 0.0)
         return {"annotation": text}
@@ -1174,22 +1229,18 @@ class SolidWorksClient:
 
     def get_bounding_box(self) -> Dict:
         doc = self._active_doc()
-        bb = None
-        # Try Extension.GetDocumentBoundingBox first (SW 2019+), then body-level, then doc-level
-        for approach in ("extension_doc", "doc_method", "body"):
-            try:
-                if approach == "extension_doc":
-                    bb = doc.Extension.GetDocumentBoundingBox(0)
-                elif approach == "doc_method":
-                    bb = doc.GetModelBoundingBox()
-                elif approach == "body":
-                    bodies = doc.GetBodies2(SW_SOLID_BODY, True)
-                    if bodies:
-                        bb = bodies[0].GetBodyBox()
-                if bb and len(bb) >= 6:
-                    break
-            except Exception:
-                bb = None
+        # IPartDoc.GetPartBox(NoConversion=True) / IAssemblyDoc.GetBox(0 = no swBoundingBoxOptions_e
+        # flags, i.e. exclude ref planes and sketches); both return [xmin, ymin, zmin, xmax, ymax, zmax] in meters.
+        doc_type = _get(doc, 'GetType')
+        try:
+            if doc_type == SW_DOC_PART:
+                bb = doc.GetPartBox(True)
+            elif doc_type == SW_DOC_ASSEMBLY:
+                bb = doc.GetBox(0)
+            else:
+                raise RuntimeError("Bounding box requires a part or assembly document.")
+        except pythoncom.com_error:
+            bb = None
         if not bb or len(bb) < 6:
             raise RuntimeError(
                 "Could not compute bounding box. "
@@ -1468,7 +1519,9 @@ class SolidWorksClient:
 
     def get_flat_pattern_info(self) -> Dict:
         doc = self._active_doc()
-        bb = doc.GetBoundingBox()
+        # IPartDoc.GetPartBox (meters); IModelDoc2/IPartDoc have no GetBoundingBox in the API.
+        # Call sw_flatten_sheet_metal first so the box is the flat pattern's extent.
+        bb = doc.GetPartBox(True)
         if not bb:
             return {"error": "Could not get flat pattern bounding box"}
         return {
@@ -1648,7 +1701,7 @@ class SolidWorksClient:
         """List materials available in a SolidWorks materials database."""
         app = self._ensure_app()
         try:
-            mats = app.GetMaterialDatabases()
+            mats = _get(app, 'GetMaterialDatabases')
             return {"databases": list(mats) if mats else [database_name]}
         except Exception:
             return {"note": "Materials databases live in C:/ProgramData/SOLIDWORKS/SOLIDWORKS XXXX/Lang/english/sldmaterials/*.sldmat"}
@@ -2105,7 +2158,7 @@ class SolidWorksClient:
         st = {"basic": 1, "machining": 2, "no_machining": 3}.get(symbol_type.lower(), 2)
         sym = doc.InsertSurfaceFinishSymbol3(st, "", roughness, "", "", "", "", "", "", "", "")
         if sym:
-            ann = sym.GetAnnotation()
+            ann = _get(sym, 'GetAnnotation')
             if ann:
                 ann.SetPosition2(_m(x), _m(y), 0.0)
         return {"surface_finish": symbol_type, "roughness": roughness}
@@ -2115,7 +2168,7 @@ class SolidWorksClient:
         doc = self._active_doc()
         sym = doc.InsertGtol()
         if sym:
-            ann = sym.GetAnnotation()
+            ann = _get(sym, 'GetAnnotation')
             if ann:
                 ann.SetPosition2(_m(x), _m(y), 0.0)
         return {"gtol": gtol_text}
@@ -2125,7 +2178,7 @@ class SolidWorksClient:
         doc = self._active_doc()
         sym = doc.InsertWeldSymbol3(text)
         if sym:
-            ann = sym.GetAnnotation()
+            ann = _get(sym, 'GetAnnotation')
             if ann:
                 ann.SetPosition2(_m(x), _m(y), 0.0)
         return {"weld_symbol": text}
@@ -2135,7 +2188,7 @@ class SolidWorksClient:
         doc = self._active_doc()
         sym = doc.InsertDatumTag2(label)
         if sym:
-            ann = sym.GetAnnotation()
+            ann = _get(sym, 'GetAnnotation')
             if ann:
                 ann.SetPosition2(_m(x), _m(y), 0.0)
         return {"datum": label}
@@ -2237,14 +2290,34 @@ class SolidWorksClient:
     def move_component(self, component_name: str, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0) -> Dict:
         """Translate a component in mm."""
         doc = self._active_doc()
-        _nc = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-        doc.Extension.SelectByID2(component_name, "COMPONENT", 0, 0, 0, False, 0, _nc, 0)
-        ms = doc.GetAssemblyManipulationManager() if hasattr(doc, 'GetAssemblyManipulationManager') else None
-        try:
-            doc.MoveComponent(_m(dx), _m(dy), _m(dz))
-        except Exception:
-            pass
-        return {"component": component_name, "moved_mm": [dx, dy, dz]}
+        if _get(doc, 'GetType') != SW_DOC_ASSEMBLY:
+            raise RuntimeError("Active document is not an assembly.")
+        # There is no MoveComponent API: offset the translation part of the component transform
+        # (MathTransform.ArrayData = 9 rotation, 3 translation [m], scale, 3 unused) and apply it
+        # with IComponent2.SetTransformAndSolve2, which also solves mates. (Assigning Transform2
+        # through late-bound COM fails with "Member not found": it needs a put-by-reference.)
+        comp = doc.GetComponentByName(component_name)
+        if comp is None:
+            raise RuntimeError(f"Component '{component_name}' not found (use the name shown by sw_get_assembly_tree, e.g. 'part-1').")
+        if _get(comp, 'IsFixed'):
+            raise RuntimeError(f"Component '{component_name}' is fixed; float it with sw_fix_component(fix=False) first.")
+        data = list(comp.Transform2.ArrayData)
+        before = data[9:12]
+        data[9] += _m(dx)
+        data[10] += _m(dy)
+        data[11] += _m(dz)
+        math_util = _get(self._ensure_app(), 'GetMathUtility')
+        # SW objects expose no type info, so late-bound win32com would treat these names as
+        # property-gets ("Member not found"); declare them as methods.
+        math_util._FlagAsMethod("CreateTransform")
+        comp._FlagAsMethod("SetTransformAndSolve2")
+        xform = math_util.CreateTransform(win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, data))
+        if not comp.SetTransformAndSolve2(xform):
+            raise RuntimeError(f"SOLIDWORKS could not move '{component_name}' (mates may constrain it).")
+        doc.UpdateBox()  # API help: avoids clipping in shaded display after a transform change
+        after = list(comp.Transform2.ArrayData)[9:12]
+        return {"component": component_name, "moved_mm": [dx, dy, dz],
+                "origin_before_mm": [_mm(v) for v in before], "origin_after_mm": [_mm(v) for v in after]}
 
     def get_assembly_tree(self) -> List[Dict]:
         """Get the assembly component tree."""
@@ -2261,7 +2334,7 @@ class SolidWorksClient:
                     "name": _get(c, 'Name2'),
                     "path": _get(c, 'GetPathName'),
                     "suppressed": _get(c, 'IsSuppressed'),
-                    "hidden": _get(c, 'Visible') == 1,
+                    "hidden": bool(c.IsHidden(False)),  # Visible==1 means *visible* (swComponentVisibilityState_e)
                 })
             except Exception:
                 pass
@@ -2430,7 +2503,7 @@ class SolidWorksClient:
         if cfg is None:
             return []
         try:
-            names = cfg.GetDisplayStates()
+            names = _get(cfg, 'GetDisplayStates')
             return list(names) if names else []
         except Exception:
             return []
