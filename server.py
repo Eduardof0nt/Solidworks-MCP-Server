@@ -99,7 +99,9 @@ def _startup_connect() -> None:
     running and will retry when the first tool is called.
     """
     try:
-        result = _sw.connect(launch_if_not_running=True, ensure_document=True)
+        # Attach only: launching via COM fails on 3DEXPERIENCE/Makers editions (sign-in
+        # gate), and auto-creating a blank Part on every client start is unwanted.
+        result = _sw.connect(launch_if_not_running=False, ensure_document=False)
         sys.stderr.write(
             f"[SW-MCP] Startup connect OK — status={result.get('status')} "
             f"version={result.get('version')} "
@@ -142,7 +144,7 @@ def _err(e: Exception) -> str:
 
 class ConnectInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
-    launch_if_not_running: bool = Field(default=True, description="Launch SolidWorks if it is not already running")
+    launch_if_not_running: bool = Field(default=False, description="Launch SolidWorks if it is not already running (fails on 3DEXPERIENCE/Makers editions; start SolidWorks manually instead)")
 
 
 class OpenDocInput(BaseModel):

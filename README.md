@@ -111,7 +111,8 @@ a subprocess.
 
 ## ▶️ First run
 
-1. Start SolidWorks (the server can auto-launch it, but starting it manually is faster).
+1. Start SolidWorks and wait for the main window. The server attaches to a running instance; it does not
+   launch SolidWorks on its own (COM launches fail on 3DEXPERIENCE / Makers editions because of the sign-in gate).
 2. Open your MCP client (Claude Desktop, Claude Code, etc.).
 3. Ask Claude: *"Connect to SolidWorks and check the status."*
 
@@ -122,7 +123,7 @@ Claude should call `sw_connect` and `sw_get_status`, returning the SolidWorks ve
 ### Connection
 | Tool | Description |
 |------|-------------|
-| `sw_connect` | Connect to SolidWorks (launches if needed) |
+| `sw_connect` | Connect to a running SolidWorks (`launch_if_not_running=true` to try launching) |
 | `sw_get_status` | Connection status + active document info |
 
 ### Files & Documents
@@ -534,7 +535,8 @@ Claude should call `sw_connect` and `sw_get_status`, returning the SolidWorks ve
 
 - All length inputs are in **millimeters (mm)**. The server converts internally to meters for the SolidWorks COM API.
 - All angles are in **degrees** (converted to radians internally).
-- SolidWorks must be open (or the server will auto-launch it via `sw_connect`).
+- SolidWorks must be open before tools are called. The server only attaches; it won't launch SolidWorks or
+  create a blank Part unless you call `sw_connect` with `launch_if_not_running=true`.
 - Entity names must match exactly as shown in the SolidWorks FeatureManager tree (case-sensitive).
 - The server runs as a **stdio MCP server** (single client, local only — no network exposure).
 - All COM calls are routed through a single STA thread to satisfy SolidWorks' threading model.

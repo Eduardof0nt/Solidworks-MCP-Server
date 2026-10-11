@@ -226,7 +226,7 @@ class SolidWorksClient:
         # ── 1. Re-use an existing live reference ──────────────────────────────
         if self._app is not None:
             try:
-                rev = self._app.RevisionNumber
+                rev = _get(self._app, 'RevisionNumber')
                 result = {"status": "already_connected", "version": rev}
                 if ensure_document:
                     self._open_default_doc_if_needed(result)
@@ -237,7 +237,7 @@ class SolidWorksClient:
         # ── 2. Attach to a running SolidWorks via COM ROT ─────────────────────
         try:
             self._app = win32com.client.GetActiveObject("SldWorks.Application")
-            result = {"status": "connected", "version": self._app.RevisionNumber}
+            result = {"status": "connected", "version": _get(self._app, 'RevisionNumber')}
             if ensure_document:
                 self._open_default_doc_if_needed(result)
             return result
@@ -246,7 +246,8 @@ class SolidWorksClient:
 
         if not launch_if_not_running:
             raise RuntimeError(
-                "SolidWorks is not running. Set launch_if_not_running=True or start SolidWorks manually."
+                "SolidWorks is not running. Ask the user to start SolidWorks, sign in, and wait for "
+                "the main window, then retry."
             )
 
         # ── 3. Launch SolidWorks via CoCreateInstance (Dispatch) ──────────────
@@ -257,7 +258,7 @@ class SolidWorksClient:
         deadline = time.time() + 30
         while time.time() < deadline:
             try:
-                rev = self._app.RevisionNumber
+                rev = _get(self._app, 'RevisionNumber')
                 if rev:
                     break
             except Exception:
@@ -266,7 +267,7 @@ class SolidWorksClient:
         else:
             raise RuntimeError("SolidWorks launched but did not become ready within 30 seconds.")
 
-        result = {"status": "launched", "version": self._app.RevisionNumber}
+        result = {"status": "launched", "version": _get(self._app, 'RevisionNumber')}
         if ensure_document:
             self._open_default_doc_if_needed(result)
         return result
@@ -307,7 +308,7 @@ class SolidWorksClient:
             except Exception:
                 return {"connected": False, "active_document": None}
         try:
-            rev = self._app.RevisionNumber
+            rev = _get(self._app, 'RevisionNumber')
         except Exception:
             self._app = None
             return {"connected": False, "active_document": None}
@@ -331,15 +332,14 @@ class SolidWorksClient:
             docs = _invoke(self._app, _DISPID_GET_DOCS)
             if docs is None:
                 info["open_documents"] = []
-            elif hasattr(docs, "__iter__"):
+            else:
+                # GetDocuments returns a tuple of raw PyIDispatch pointers (or a single
+                # one); wrap each so _get can read its properties.
+                items = docs if isinstance(docs, (tuple, list)) else [docs]
+                wrapped = [d if hasattr(d, "_oleobj_") else win32com.client.Dispatch(d) for d in items]
                 info["open_documents"] = [
                     {"title": _get(d, 'GetTitle'), "type": _doc_type_name(_get(d, 'GetType'))}
-                    for d in docs
-                ]
-            else:
-                # Single document returned (not wrapped in sequence)
-                info["open_documents"] = [
-                    {"title": docs.GetTitle(), "type": _doc_type_name(docs.GetType())}
+                    for d in wrapped
                 ]
         except Exception:
             info["open_documents"] = []
@@ -2657,13 +2657,14 @@ class SolidWorksClient:
     # ─── Helpers ─────────────────────────────────────────────────────────────
 
     def _ensure_app(self) -> Any:
+        # Attach only — never launch SolidWorks or auto-create a Part from a tool call.
         if self._app is None:
-            self.connect(launch_if_not_running=True)
+            self.connect(launch_if_not_running=False, ensure_document=False)
         try:
-            _ = self._app.RevisionNumber
+            _ = _get(self._app, 'RevisionNumber')
         except Exception:
             self._app = None
-            self.connect(launch_if_not_running=True)
+            self.connect(launch_if_not_running=False, ensure_document=False)
         return self._app
 
     def _active_doc(self) -> Any:
